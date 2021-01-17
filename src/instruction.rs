@@ -1,131 +1,101 @@
-use itertools::Itertools;
-//use lazy_static::lazy_static;
-use std::convert::TryFrom;
+use std::collections::HashMap;
 
-#[derive(Debug)]
-pub enum InstructionArgType {
-    Device,
-    Register,
-    Parameter,
-    Number,
-    Token,
+use float_cmp::approx_eq;
+use maplit::hashmap;
+use regex::Regex;
+
+use crate::{device::ParameterSet, ic::ICState};
+
+pub trait InstructionSet {
+    fn try_run(
+        &self,
+        instr_token: &str,
+        args: Vec<&str>,
+        ic: &mut ICState,
+        parameters: &ParameterSet,
+    ) -> Result<(), String>;
 }
 
-impl TryFrom<&str> for InstructionArgType {
-    type Error = &'static str;
-    fn try_from(token: &str) -> Result<Self, Self::Error> {
-        let arg = match token {
-            "d" => Self::Device,
-            "r" => Self::Register,
-            "p" => Self::Parameter,
-            "n" => Self::Number,
-            "t" => Self::Token,
-            _ => return Err("Invalid argument token"),
-        };
-        Ok(arg)
-    }
-}
+pub type Instruction = Box<dyn Fn(&mut ICState, Vec<&str>) -> Result<(), String>>;
 
-pub enum InstructionArg<'a> {
-    Device(&'a str),
-    Register(&'a str),
-    Number(u8),
-}
-
-//#[derive(Debug)]
-pub struct Instruction<'a> {
-    pub name: &'a str,
-    pub f: fn(&[InstructionArg]),
-    pub args: Vec<Vec<InstructionArgType>>,
-}
-
-impl<'a> Instruction<'a> {
-    pub fn new(
-        name: &'a str,
-        f: fn(&[InstructionArg]),
-        args: Vec<Vec<&str>>,
-    ) -> Result<Self, &'static str> {
-        let args = args
-            .iter()
-            .map(|types| {
-                types
-                    .iter()
-                    .cloned()
-                    .map(InstructionArgType::try_from)
-                    .try_collect()
-            })
-            .try_collect()?;
-        Ok(Self { name, f, args })
-    }
+pub struct StationeersInstructionSet {
+    groups: Vec<(Regex, HashMap<&'static str, Instruction>)>,
+    singles: HashMap<&'static str, Instruction>,
 }
 
 macro_rules! instruction {
-    // Numeric argument
-    (@arg $p:ident n) => {
-        InstructionArg::Number($p)
+    (@arg $ic:ident, $a:ident.a) => {
+        $ic.try_alias($a)?;
     };
-    // TODO other arguments...
-    ($name:ident, [$(($($args:ident),*)),*], |$($p:ident.$t:ident),*| $body:block) => {
-        Instruction::new(
-            stringify!($name),
-            |args: &[InstructionArg]| match args {
-                [$(instruction!(@arg $p $t)),*] => {
-                    $body
+    (@arg $ic:ident, $a:ident.r) => {
+        $ic.try_register($a)?
+    };
+    (@arg $ic:ident, $a:ident.n) => {
+        $ic.try_number($a)?
+    };
+    (@arg $ic:ident, $a:ident.t) => {
+        $a // &str
+    };
+    ($ic:ident, [$($a:ident.$t:tt),*], $body:expr) => {{
+        Box::new(|ic: &mut ICState, args: Vec<&str>| -> Result<(), String> {
+            match args.as_slice() {
+                [$($a),*] => {
+                    let $ic: &mut ICState = ic;
+                    $(
+                        let $a = instruction!(@arg $ic, $a.$t);
+                    )*
+                    $body;
+                    Ok(())
                 }
-                _ => panic!("Invalid arguments to instruction!"),
-            },
-            vec![$(vec![$(stringify!($args)),*]),*]
-        ).unwrap()
-    };
-}
-macro_rules! instructions {
-    ($(($name:ident, [$(($($args:ident),*)),*], |$($p:ident.$t:ident),*| $body:block)),*$(,)*) => {
-    //($(($name:ident, [$(($($args:ident),*)),*], |$($p:ident.$t:ident),*| $body:block)),*) => {
-        vec![
-            $(instruction!($name, [$(($($args),*)),*], |$($p.$t),*| $body)),*
-        ]
-    };
+                _ => Err("Failed for arguments".to_owned()),
+            }
+        }) as Instruction
+    }};
 }
 
-// Stationeers MIPS instructions
-// (see https://stationeering.com/tools/ic)
-/*
- *#[rustfmt::skip]
- *lazy_static! {
- *    pub static ref INSTRS_DVIO: Vec<Instruction<'static>> = instructions![
- *        //(bdns,   f!(println!("test")), [d], [r, n]), // (branching)
- *        //(bdnsal, f!(1), [d], [r, n]),
- *        //(bdse,   f!(1), [d], [r, n]),
- *        //(bdseal, f!(1), [d], [r, n]),
- *        //(brdns,  f!(1), [d], [r, n]),
- *        //(brdse,  f!(1), [d], [r, n]),
- *        // TODO the res...
- *    ];
- *    pub static ref INSTRS_FLOW: Vec<Instruction<'static>> = instructions! [
- *        //(j, f!(1), [r, n]),
- *        // TODO the rest...
- *    ];
- *    pub static ref INSTRS_VSEL: Vec<Instruction<'static>> = instructions! [
- *        // TODO the rest...
- *    ];
- *    pub static ref INSTRS_MATH: Vec<Instruction<'static>> = instructions! [
- *        //(add, f!(1), [r], [r, n], [r, n])
- *        (add, [(n), (n)], |a.n, b.n| {
- *            println!("{}", a + b);
- *        }),
- *        (add, [(n), (n)], |a.n, b.n| {
- *            println!("{}", a + b);
- *        }),
- *        // TODO the rest...
- *    ];
- *    pub static ref INSTRS_BOOL: Vec<Instruction<'static>> = instructions! [
- *        // TODO the rest...
- *    ];
- *    pub static ref INSTRS_STCK: Vec<Instruction<'static>> = instructions! [
- *        // TODO the rest...
- *    ];
- *    pub static ref INSTRS_MISC: Vec<Instruction<'static>> = instructions! [
- *        // TODO the rest...
- *    ];
- *}
- */
+impl StationeersInstructionSet {
+    pub fn new() -> Self {
+        Self {
+            singles: hashmap! {
+                    "alias" => instruction!(ic, [t.t, a.a],
+                        { ic.add_alias(t, a) }),
+                    "add"   => instruction!(ic, [r.r, a.n, b.n],
+                        { ic.set_register(r, a + b)? }),
+                    "sub"   => instruction!(ic, [r.r, a.n, b.n],
+                        { ic.set_register(r, a - b)? }),
+                    "yield" => instruction!(ic, [],
+                        { ic.halt = true }),
+                    "j"     => instruction!(ic, [l.n],
+                        { ic.next_line = l as usize }),
+                    "beq"   => instruction!(ic, [a.n, b.n, l.n],
+                        { if approx_eq!(f32, a, b) { ic.next_line = l as usize; } }),
+                    "bne"   => instruction!(ic, [a.n, b.n, l.n],
+                        { if !approx_eq!(f32, a, b) { ic.next_line = l as usize } })
+            },
+            groups: vec![],
+        }
+    }
+}
+
+impl InstructionSet for StationeersInstructionSet {
+    fn try_run(
+        &self,
+        instr_token: &str,
+        args: Vec<&str>,
+        ic: &mut ICState,
+        _parameters: &ParameterSet,
+    ) -> Result<(), String> {
+        if let Some(instr) = self.singles.get(instr_token) {
+            return instr(ic, args);
+        } else {
+            for (p, singles) in self.groups.iter() {
+                if p.is_match(instr_token) {
+                    if let Some(instr) = singles.get(instr_token) {
+                        return instr(ic, args);
+                    }
+                }
+            }
+        }
+        Err(format!("Unrecognized instruction '{}'!", instr_token))
+    }
+}

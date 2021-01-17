@@ -57,6 +57,14 @@ impl StationeersInstructionSet {
     pub fn new() -> Self {
         Self {
             singles: hashmap! {
+                 // "<name>" => instruction!(ic,
+                 //     [(<var>.<type>)*],
+                 //     { <expressions> }),
+                 // where type:
+                 // * `a` - alias (device or register)
+                 // * `r` - register (alias)
+                 // * `n` - a number (either a literal or a register alias)
+                 // * `t` - token (a alias/define/parameter string)
                     "alias" => instruction!(ic, [t.t, a.a],
                         { ic.add_alias(t, a) }),
                     "add"   => instruction!(ic, [r.r, a.n, b.n],

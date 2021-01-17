@@ -5,189 +5,307 @@ use std::io::{BufRead, BufReader, Read, Result as IOResult};
 use std::iter::once;
 use std::path::Path;
 
+use float_cmp::approx_eq;
+use itertools::Itertools;
+use maplit::hashmap;
 use petgraph::graph::{DiGraph, Graph, NodeIndex};
+use regex::Regex;
+use std::convert::TryFrom;
 
-#[macro_use]
-pub mod instruction;
-use instruction::{Instruction, InstructionArg, InstructionArgType};
-
-/*
- *#[derive(Debug)]
- *enum TokenType {
- *    Uncategorized,
- *    Assignment,
- *    Instruction,
- *    Device,
- *    Register,
- *    Parameter,
- *    Label,
- *    Comment,
- *}
- *
- *#[derive(Debug)]
- *struct Token {
- *    raw: String,
- *    token_type: TokenType,
- *}
- *
- *impl Token {
- *    fn new(raw: &str) -> Self {
- *        Self {
- *            raw: raw.to_owned(),
- *            token_type: TokenType::Uncategorized,
- *        }
- *    }
- *}
- *
- *fn parse_token(token: &Token) {
- *    match token.raw.as_str() {
- *        "define" => {}
- *        "alias" => {}
- *        _ => {}
- *    }
- *}
- *
- *#[derive(Debug)]
- *enum Node {
- *    Register(String),
- *    Device(String),
- *    Definition,
- *}
- *
- *struct Parser {
- *    tokens: Vec<Token>,
- *    graph: Graph<u8, u8>,
- *    aliases: HashMap<String, NodeIndex>,
- *}
- *
- *impl Parser {
- *    fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
- *        let file = File::open(path)?;
- *        let lines: Vec<String> = BufReader::new(file)
- *            .lines()
- *            .into_iter()
- *            .filter_map(|l| l.ok())
- *            .collect();
- *        let tokens: Vec<Token> = lines
- *            .iter()
- *            .flat_map(|l| l.split(' ').map(|t| Token::new(t)))
- *            .collect();
- *        Ok(Self {
- *            tokens,
- *            ..Default::default()
- *        })
- *    }
- *
- *    fn parse(&mut self) {
- *        //for n in self.nodes.iter() {
- *        //println!("{:?}", n);
- *        //}
- *        //for t in self.tokens.iter() {
- *        //println!("{:?}", t);
- *        //}
- *        //let mut stack = vec![];
- *        //let mut aliases = vec![];
- *    }
- *}
- *
- *impl Default for Parser {
- *    fn default() -> Self {
- *        let mut aliases = HashMap::new();
- *        //for (0..6).map(|i| Node::Device
- *        //let devices = (0..6).map(|i| Node::Device(format!("d{}", i)));
- *        //let registers = (0..16)
- *        //.map(|i| Node::Register(format!("r{}", i)))
- *        //.chain(["ra", "sp"].iter().map(|l| Node::Register(l.to_string())));
- *        Self {
- *            tokens: vec![],
- *            //nodes: devices.chain(registers).collect(),
- *            graph: Graph::new(),
- *            aliases,
- *        }
- *    }
- *}
- */
+//#[macro_use]
+//pub mod instruction;
+//use instruction::{Instruction, InstructionArg, InstructionArgType};
 
 #[derive(Clone)]
-enum Device {
+pub enum Device {
     Unset,
     Set(HashMap<String, f32>),
 }
 
-enum Alias {
-    Device(usize),
-    Register(usize),
+// bool: is_default
+#[derive(Clone, Copy, Debug)]
+pub enum Alias {
+    Device(usize, bool),
+    Register(usize, bool),
 }
 
-struct ICState {
+pub type ParameterSet = Vec<String>;
+
+pub trait InstructionSet {
+    fn try_run(
+        &self,
+        instr_token: &str,
+        args: Vec<&str>,
+        ic: &mut ICState,
+        parameters: &ParameterSet,
+    ) -> Result<(), String>;
+}
+
+pub type Instruction = Box<dyn Fn(&mut ICState, Vec<&str>) -> Result<(), String>>;
+
+pub struct StationeersInstructionSet {
+    groups: Vec<(Regex, HashMap<&'static str, Instruction>)>,
+    singles: HashMap<&'static str, Instruction>,
+}
+
+macro_rules! instruction {
+    (@arg $ic:ident, $a:ident.a) => {
+        $ic.try_alias($a)?;
+    };
+    (@arg $ic:ident, $a:ident.r) => {
+        $ic.try_register($a)?
+    };
+    (@arg $ic:ident, $a:ident.n) => {
+        $ic.try_number($a)?
+    };
+    (@arg $ic:ident, $a:ident.t) => {
+        $a // &str
+    };
+    ($ic:ident, [$($a:ident.$t:tt),*], $body:expr) => {{
+        Box::new(|ic: &mut ICState, args: Vec<&str>| -> Result<(), String> {
+            match args.as_slice() {
+                [$($a),*] => {
+                    let $ic: &mut ICState = ic;
+                    $(
+                        let $a = instruction!(@arg $ic, $a.$t);
+                    )*
+                    $body;
+                    Ok(())
+                }
+                _ => Err("Failed for arguments".to_owned()),
+            }
+        }) as Instruction
+    }};
+}
+
+impl StationeersInstructionSet {
+    pub fn new() -> Self {
+        Self {
+            singles: hashmap! {
+                    "alias" => instruction!(ic, [t.t, a.a],
+                        { ic.add_alias(t, a) }),
+                    "add"   => instruction!(ic, [r.r, a.n, b.n],
+                        { ic.set_register(r, a + b)? }),
+                    "sub"   => instruction!(ic, [r.r, a.n, b.n],
+                        { ic.set_register(r, a - b)? }),
+                    "yield" => instruction!(ic, [], { ic.halt = true }),
+                    "j" => instruction!(ic, [l.n],
+                        { ic.next_line = l as usize }),
+                    "beq" => instruction!(ic, [a.n, b.n, l.n],
+                        { if approx_eq!(f32, a, b) { ic.next_line = l as usize; } }),
+                    "bne" => instruction!(ic, [a.n, b.n, l.n],
+                        { if !approx_eq!(f32, a, b) { ic.next_line = l as usize } })
+            },
+            groups: vec![],
+        }
+    }
+}
+
+impl InstructionSet for StationeersInstructionSet {
+    fn try_run(
+        &self,
+        instr_token: &str,
+        args: Vec<&str>,
+        ic: &mut ICState,
+        parameters: &ParameterSet,
+    ) -> Result<(), String> {
+        if let Some(instr) = self.singles.get(instr_token) {
+            return instr(ic, args);
+        } else {
+            for (p, singles) in self.groups.iter() {
+                if p.is_match(instr_token) {
+                    if let Some(instr) = singles.get(instr_token) {
+                        return instr(ic, args);
+                    }
+                }
+            }
+        }
+        Err(format!("Unrecognized instruction '{}'!", instr_token))
+    }
+}
+
+pub struct ICState {
+    // Hard state
     devices: Vec<Device>,
     registers: Vec<f32>,
     aliases: HashMap<String, Alias>,
+    definitions: HashMap<String, f32>,
+    labels: HashMap<String, usize>,
+    // Operation state
+    next_line: usize,
+    instr_per_tick: usize,
+    instr_counter: usize,
+    halt: bool,
 }
 
 impl ICState {
-    pub fn new(ndevices: usize, nregisters: usize) -> Self {
-        let daliases = (0..ndevices).map(|i| (format!("d{}", i), Alias::Device(i)));
+    pub fn new(ndevices: usize, nregisters: usize, instr_per_tick: usize) -> Self {
+        let daliases = (0..ndevices).map(|i| (format!("d{}", i), Alias::Device(i, true)));
         let raliases = (0..nregisters)
-            .map(|i| (format!("r{}", i), Alias::Register(i)))
+            .map(|i| (format!("r{}", i), Alias::Register(i, true)))
             .chain(
                 ["ra", "sp"]
                     .iter()
                     .enumerate()
-                    .map(|(i, &l)| (l.to_owned(), Alias::Register(i + nregisters + 1))),
+                    .map(|(i, &l)| (l.to_owned(), Alias::Register(i + nregisters + 1, true))),
             );
         Self {
             devices: vec![Device::Unset; ndevices],
-            registers: vec![0.0; nregisters],
+            registers: vec![0.0; nregisters + 2],
             aliases: daliases.chain(raliases).collect(),
+            definitions: HashMap::new(),
+            labels: HashMap::new(),
+            next_line: 0,
+            instr_per_tick,
+            instr_counter: 0,
+            halt: false,
         }
+    }
+
+    pub fn get_ra(&self) -> f32 {
+        self.registers[self.registers.len() - 2]
+    }
+
+    pub fn set_ra(&mut self, v: f32) {
+        let i = self.registers.len() - 2;
+        self.registers[i] = v;
+    }
+
+    pub fn get_sp(&self) -> f32 {
+        self.registers[self.registers.len() - 1]
+    }
+
+    pub fn set_sp(&mut self, v: f32) {
+        let i = self.registers.len() - 1;
+        self.registers[i] = v;
+    }
+
+    pub fn set_register(&mut self, r: Alias, v: f32) -> Result<(), String> {
+        if let Some(r) = {
+            if let Alias::Register(i, _) = r {
+                self.registers.get_mut(i)
+            } else {
+                None
+            }
+        } {
+            (*r) = v;
+            Ok(())
+        } else {
+            Err("Invalid register index".to_owned())
+        }
+    }
+
+    pub fn add_alias(&mut self, t: &str, a: Alias) {
+        let a = match a {
+            Alias::Device(d, _) => Alias::Device(d, false),
+            Alias::Register(r, _) => Alias::Register(r, false),
+        };
+        self.aliases.insert(t.to_owned(), a);
+    }
+
+    fn try_alias(&self, token: &str) -> Result<Alias, String> {
+        match self.aliases.get(token) {
+            Some(a) => Ok(*a),
+            _ => Err(format!("'{}' failed as alias", token)),
+        }
+    }
+
+    fn try_register(&self, token: &str) -> Result<Alias, String> {
+        match self.aliases.get(token) {
+            Some(Alias::Register(i, f)) => Ok(Alias::Register(*i, *f)),
+            _ => Err(format!("'{}' failed to parse as register", token)),
+        }
+    }
+
+    fn try_number(&self, token: &str) -> Result<f32, String> {
+        if let Ok(n) = token.parse::<f32>() {
+            Ok(n)
+        } else if let Some(Alias::Register(i, _)) = self.aliases.get(token) {
+            Ok(self.registers[*i])
+        } else {
+            Err("Not a number!".to_owned())
+        }
+    }
+}
+
+impl std::fmt::Display for ICState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for (i, v) in self
+            .registers
+            .iter()
+            .take(self.registers.len() - 2)
+            .enumerate()
+        {
+            writeln!(f, "{:>3}:{}", format!("r{}", i), v)?;
+        }
+        writeln!(f, " ra:{}", self.get_ra())?;
+        writeln!(f, " sp:{}", self.get_sp())?;
+        for (k, v) in self.aliases.iter() {
+            match v {
+                Alias::Device(i, false) => writeln!(f, "{} -> d{}", k, i)?,
+                Alias::Register(i, false) => writeln!(f, "{} -> r{}", k, i)?,
+                _ => {}
+            };
+        }
+        Ok(())
     }
 }
 
 impl Default for ICState {
     fn default() -> Self {
-        Self::new(6, 16)
+        Self::new(6, 16, 128)
     }
 }
 
-#[derive(Debug)]
-enum Arg {
-    Device(usize),
-    Register(usize),
-    Number(f32),
-    Parameter(String),
+pub fn try_run_line<I: InstructionSet>(
+    ic: &mut ICState,
+    line: &str,
+    instructions: &I,
+    parameters: &ParameterSet,
+) -> Result<(), String> {
+    let mut tokens = line.split(" ");
+    if let Some(instr) = tokens.next() {
+        let args = tokens.collect();
+        instructions.try_run(instr, args, ic, parameters)
+    } else {
+        // empty line error?
+        Err(format!("Empty line?"))
+    }
 }
 
-impl Arg {
-    fn to_number(self, ic: &ICState) -> Result<f32, String> {
-        match self {
-            Arg::Register(i) => match ic.registers.get(i) {
-                Some(n) => Ok(*n),
-                None => Err(format!("Index {} out of register range!", i)),
-            },
-            Arg::Number(n) => Ok(n),
-            _ => Err(format!("Can't convert {:?} to number!", self)),
+pub fn try_run<I: InstructionSet>(
+    ic: &mut ICState,
+    lines: &Vec<String>,
+    instruction: &I,
+    parameters: &ParameterSet,
+) -> Result<(), String> {
+    while !(ic.halt || ic.instr_counter >= ic.instr_per_tick || ic.next_line >= lines.len()) {
+        let i = ic.next_line;
+        ic.next_line += 1;
+        if let Some(line) = lines.get(i) {
+            try_run_line(ic, line, instruction, parameters)?;
+            ic.instr_counter += 1;
+        } else {
+            return Err(format!("Line index '{}' out of range", ic.next_line));
         }
     }
+    Ok(())
 }
 
 fn main() -> IOResult<()> {
+    let instructions = StationeersInstructionSet::new();
+    let parameters = ParameterSet::default();
     let mut ic = ICState::default();
 
-    ic.registers[0] = 3.14;
+    let file = File::open("test.mips").unwrap();
+    let lines: Vec<String> = BufReader::new(file).lines().try_collect().unwrap();
+    let mips = lines.join("\n");
 
-    let f = |ic: &mut ICState| {};
-    f(&mut ic);
+    println!("Running(\n\"\n{}\n\")", mips);
 
-    //let arg = Arg::Device(0);
-    let arg = Arg::Register(0);
-    let arg = Arg::Number(8.314);
-    //let arg = Arg::Parameter("On".to_owned());
-
-    match arg.to_number(&ic) {
-        Ok(n) => println!("{}", n),
-        Err(e) => println!("Error: {}", e),
-    };
+    println!("{:?}", try_run(&mut ic, &lines, &instructions, &parameters));
+    print!("{}", ic);
+    println!("ic.instr_counter = {}", ic.instr_counter);
 
     //#[rustfmt::skip]
     //let add = instruction!(add, [(n), (n)], |a.n, b.n| {

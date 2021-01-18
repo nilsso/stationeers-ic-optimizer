@@ -1,3 +1,0 @@
-alias x r0
-add x x 1
-bne x 5 1

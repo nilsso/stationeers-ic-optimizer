@@ -1,0 +1,6 @@
+define N 10
+alias x r0
+move x 3.14
+loop:
+add x x 1
+brne x N loop

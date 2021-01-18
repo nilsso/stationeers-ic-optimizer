@@ -5,21 +5,21 @@ TODO:
 - Implement Networks, overhaul devices to be owned by networks instead of IC's,
   and have IC's reference devices on networks.
 - **Idea:**
-  - Recognizes jump functions and able to decompose them.
+  - Recognize jump functions, and able to decompose them.
 
-    e.g.
-    ```mips
+e.g.:
+```mips
 main:
 jal f
 j main
 
 f:
 move r0 3.14
-    ```
-    should become
-    ```mips
+```
+should become
+```mips
 main:
 move r0 3.14
 j main
-    ```
+```
 
